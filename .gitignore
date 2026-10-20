@@ -1,0 +1,10 @@
+# Exclude local tests, executable, and build file
+/tests/
+/chat_server
+/Makefile
+
+# C/C++ build artifacts
+*.o
+*.a
+*.so
+*.d
