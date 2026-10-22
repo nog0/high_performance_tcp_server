@@ -16,6 +16,7 @@ public:
     using MessageCallback = std::function<void(const std::shared_ptr<TcpConnection>&,
                                                const std::string&)>;
     using CloseCallback = std::function<void(int, const char*)>;
+    using ActivityCallback = std::function<void()>;
 
     TcpConnection(EventLoop& loop, int fd);
     ~TcpConnection();
@@ -31,6 +32,8 @@ public:
     void close(const char* reason);
     void setMessageCallback(MessageCallback callback) { message_callback_ = std::move(callback); }
     void setCloseCallback(CloseCallback callback) { close_callback_ = std::move(callback); }
+    // Set before start(); invoked on the owning loop after each successful read.
+    void setActivityCallback(ActivityCallback callback) { activity_callback_ = std::move(callback); }
 
 private:
     void handleRead();
@@ -48,4 +51,5 @@ private:
     bool closed_ = false;
     MessageCallback message_callback_;
     CloseCallback close_callback_;
+    ActivityCallback activity_callback_;
 };

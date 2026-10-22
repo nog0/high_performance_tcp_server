@@ -1,11 +1,14 @@
 #include "../net/acceptor.h"
+#include "../net/connection_manager.h"
 #include "../net/event_loop.h"
 #include "../net/event_loop_pool.h"
+#include "../net/heartbeat_manager.h"
 #include "../net/tcp_connection.h"
 
 #include <arpa/inet.h>
 #include <cctype>
 #include <cerrno>
+#include <chrono>
 #include <cstdlib>
 #include <cstdint>
 #include <iostream>
@@ -34,15 +37,19 @@ std::string after_first_word(const std::string& text, std::size_t start) {
 
 class ChatServer {
 public:
-    ChatServer(std::uint16_t port, std::size_t worker_count)
-        : port_(port), workers_(worker_count), acceptor_(main_loop_, port) {
+    ChatServer(std::uint16_t port, std::size_t worker_count,
+               HeartbeatManager::Options heartbeat_options)
+        : port_(port), workers_(worker_count), heartbeats_(heartbeat_options),
+          acceptor_(main_loop_, port) {
         acceptor_.setNewConnectionCallback(
             [this](int fd, const sockaddr_in& peer) { accept_client(fd, peer); });
     }
 
     ~ChatServer() {
         acceptor_.stop();
+        heartbeats_.stop();
         workers_.stop();
+        connections_.clear();
         std::lock_guard<std::mutex> lock(clients_mutex_);
         clients_.clear();
         names_.clear();
@@ -59,18 +66,12 @@ public:
     }
 
 private:
+    using ConnectionId = ConnectionManager::ConnectionId;
+
     struct Client {
-        std::shared_ptr<TcpConnection> connection;
         std::string name;
         bool quitting = false;
     };
-
-    // Call with clients_mutex_ held. All TcpConnection I/O runs on its worker.
-    static void queueSend(const std::shared_ptr<TcpConnection>& connection,
-                          std::string message) {
-        connection->loop().queueInLoop(
-            [connection, message = std::move(message)] { connection->send(message); });
-    }
 
     void accept_client(int fd, const sockaddr_in& peer) {
         EventLoop* worker = workers_.nextLoop();
@@ -78,11 +79,12 @@ private:
             ::close(fd);
             return;
         }
-        const std::uint64_t id = next_client_id_++;
         auto connection = std::make_shared<TcpConnection>(*worker, fd);
+        const ConnectionId id = connections_.add(connection);
+        connection->setActivityCallback([this, id] { heartbeats_.touch(id); });
         connection->setMessageCallback(
-            [this, id](const auto& client, const auto& line) {
-                handle_command(id, client, line);
+            [this, id](const auto&, const auto& line) {
+                handle_command(id, line);
             });
         connection->setCloseCallback(
             [this, id](int closed_fd, const char* reason) {
@@ -93,50 +95,56 @@ private:
         inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof(ip));
         {
             std::lock_guard<std::mutex> lock(clients_mutex_);
-            clients_.emplace(id, Client{connection, "", false});
+            clients_.emplace(id, Client{"", false});
             std::cout << "accepted " << ip << ':' << ntohs(peer.sin_port)
                       << " (fd=" << fd << ")\n";
         }
-        worker->queueInLoop([connection] {
-            if (connection->start()) {
-                connection->send("Welcome. Use /login <name> first.\n");
-            } else {
+        worker->queueInLoop([this, id, connection] {
+            if (!connection->start()) {
                 connection->close("epoll registration failed");
+            } else if (!heartbeats_.add(id, connection)) {
+                connection->close("heartbeat registration failed");
+            } else {
+                connection->send("Welcome. Use /login <name> first.\n");
             }
         });
     }
 
-    void handle_command(std::uint64_t id,
-                        const std::shared_ptr<TcpConnection>& connection,
-                        const std::string& line) {
+    void handle_command(ConnectionId id, const std::string& line) {
         std::lock_guard<std::mutex> lock(clients_mutex_);
         auto sender_it = clients_.find(id);
         if (sender_it == clients_.end() || sender_it->second.quitting) return;
         Client& sender = sender_it->second;
 
+        if (line == "PONG") return;
+        if (line == "PING") {
+            connections_.send(id, "PONG\n");
+            return;
+        }
+
         if (line.rfind("/login ", 0) == 0) {
             const std::string name = after_first_word(line, 6);
             if (!valid_name(name)) {
-                queueSend(connection, "ERROR: name must be 1-24 letters, digits, _, or -.\n");
+                connections_.send(id, "ERROR: name must be 1-24 letters, digits, _, or -.\n");
             } else if (!sender.name.empty()) {
-                queueSend(connection, "ERROR: already logged in as " + sender.name + ".\n");
+                connections_.send(id, "ERROR: already logged in as " + sender.name + ".\n");
             } else if (names_.count(name)) {
-                queueSend(connection, "ERROR: name is already in use.\n");
+                connections_.send(id, "ERROR: name is already in use.\n");
             } else {
                 sender.name = name;
                 names_[name] = id;
-                queueSend(connection, "OK: logged in as " + name + ".\n");
+                connections_.send(id, "OK: logged in as " + name + ".\n");
             }
             return;
         }
         if (line == "/quit") {
             sender.quitting = true;
-            queueSend(connection, "bye\n");
-            connection->loop().queueInLoop([connection] { connection->shutdown(); });
+            connections_.send(id, "bye\n");
+            connections_.shutdown(id);
             return;
         }
         if (sender.name.empty()) {
-            queueSend(connection, "ERROR: use /login <name> first.\n");
+            connections_.send(id, "ERROR: use /login <name> first.\n");
             return;
         }
 
@@ -144,13 +152,13 @@ private:
         if (line.rfind("/broadcast ", 0) == 0) {
             const std::string message = after_first_word(line, 10);
             if (message.empty()) {
-                queueSend(connection, "ERROR: /broadcast needs text.\n");
+                connections_.send(id, "ERROR: /broadcast needs text.\n");
                 return;
             }
             const std::string rendered = "[" + sender_name + "] " + message + "\n";
             for (const auto& entry : clients_) {
                 if (!entry.second.name.empty() && !entry.second.quitting) {
-                    queueSend(entry.second.connection, rendered);
+                    connections_.send(entry.first, rendered);
                 }
             }
             return;
@@ -163,28 +171,32 @@ private:
                 space == std::string::npos ? "" : after_first_word(rest, space);
             auto recipient_it = names_.find(recipient_name);
             if (recipient_name.empty() || message.empty()) {
-                queueSend(connection, "ERROR: usage: /msg <name> <text>\n");
+                connections_.send(id, "ERROR: usage: /msg <name> <text>\n");
             } else if (recipient_it == names_.end()) {
-                queueSend(connection, "ERROR: user " + recipient_name + " is not online.\n");
+                connections_.send(id, "ERROR: user " + recipient_name + " is not online.\n");
             } else {
-                const std::uint64_t recipient_id = recipient_it->second;
+                const ConnectionId recipient_id = recipient_it->second;
                 auto target = clients_.find(recipient_id);
-                if (target != clients_.end() && !target->second.quitting) {
-                    queueSend(target->second.connection,
-                              "[private from " + sender_name + "] " + message + "\n");
+                if (target == clients_.end() || target->second.quitting) {
+                    connections_.send(id, "ERROR: user " + recipient_name + " is not online.\n");
+                    return;
                 }
+                connections_.send(recipient_id,
+                                  "[private from " + sender_name + "] " + message + "\n");
                 if (recipient_id != id) {
-                    queueSend(connection,
-                              "[private to " + recipient_name + "] " + message + "\n");
+                    connections_.send(id,
+                                      "[private to " + recipient_name + "] " + message + "\n");
                 }
             }
             return;
         }
-        queueSend(connection, "ERROR: commands: /login, /msg, /broadcast, /quit\n");
+        connections_.send(id, "ERROR: commands: /login, /msg, /broadcast, /quit, PING, PONG\n");
     }
 
-    void disconnect(std::uint64_t id, int fd, const char* reason) {
+    void disconnect(ConnectionId id, int fd, const char* reason) {
+        heartbeats_.remove(id);
         std::lock_guard<std::mutex> lock(clients_mutex_);
+        connections_.remove(id);
         auto it = clients_.find(id);
         if (it == clients_.end()) return;
         if (!it->second.name.empty()) names_.erase(it->second.name);
@@ -195,11 +207,12 @@ private:
     std::uint16_t port_;
     EventLoop main_loop_;
     EventLoopPool workers_;
+    ConnectionManager connections_;
+    HeartbeatManager heartbeats_;
     Acceptor acceptor_;
     std::mutex clients_mutex_;
-    std::uint64_t next_client_id_ = 1;
-    std::unordered_map<std::uint64_t, Client> clients_;
-    std::unordered_map<std::string, std::uint64_t> names_;
+    std::unordered_map<ConnectionId, Client> clients_;
+    std::unordered_map<std::string, ConnectionId> names_;
 };
 
 bool parse_port(const char* text, std::uint16_t& result) {
@@ -221,11 +234,24 @@ bool parse_workers(const char* text, std::size_t& result) {
     return true;
 }
 
+bool parse_seconds(const char* text, std::chrono::milliseconds& result) {
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long value = std::strtoul(text, &end, 10);
+    if (*text == '\0' || *end != '\0' || errno != 0 || value < 1 || value > 86400) {
+        return false;
+    }
+    result = std::chrono::seconds(value);
+    return true;
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
-    if (argc != 2 && argc != 3) {
-        std::cerr << "Usage: " << argv[0] << " <listen-port> [worker-count]\n";
+    if (argc < 2 || argc > 5) {
+        std::cerr << "Usage: " << argv[0]
+                  << " <listen-port> [worker-count] [heartbeat-interval-seconds]"
+                     " [heartbeat-timeout-seconds]\n";
         return 2;
     }
     std::uint16_t port;
@@ -234,12 +260,19 @@ int main(int argc, char* argv[]) {
         return 2;
     }
     std::size_t worker_count = 4;
-    if (argc == 3 && !parse_workers(argv[2], worker_count)) {
+    if (argc >= 3 && !parse_workers(argv[2], worker_count)) {
         std::cerr << "worker-count must be in 1..64\n";
         return 2;
     }
+    HeartbeatManager::Options heartbeat_options;
+    if ((argc >= 4 && !parse_seconds(argv[3], heartbeat_options.interval)) ||
+        (argc >= 5 && !parse_seconds(argv[4], heartbeat_options.timeout)) ||
+        heartbeat_options.timeout <= heartbeat_options.interval) {
+        std::cerr << "heartbeat seconds must be in 1..86400 and timeout must exceed interval\n";
+        return 2;
+    }
     signal(SIGPIPE, SIG_IGN);
-    ChatServer server(port, worker_count);
+    ChatServer server(port, worker_count, heartbeat_options);
     if (!server.init()) return 1;
     server.run();
 }

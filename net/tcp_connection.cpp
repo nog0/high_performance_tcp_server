@@ -59,6 +59,8 @@ void TcpConnection::handleRead() {
         const ssize_t count = recv(fd_, input_.beginWrite(), kReadChunk, 0);
         if (count > 0) {
             input_.hasWritten(static_cast<std::size_t>(count));
+            if (activity_callback_) activity_callback_();
+            if (closed_) return;
             if (input_.readableBytes() > kMaxInputBytes) {
                 close("input buffer limit reached");
                 return;
